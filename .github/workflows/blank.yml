@@ -1,33 +1,275 @@
-# This is a basic workflow to help you get started with Actions
+/*******************************************************************************************************************
+@@暑期竞培营结营项目比赛程序
+	@<1>PID的位置闭环控制的数值是线数，已经处理了减速比，因此8192线为输出轴转一圈
+	@<2>电机转轴朝向自己，正的线数值逆时针旋转，负的值顺时针旋转
+	@<3>把PID的控制放在了定时器中断中，控制频率200Hz
+@@修改：2018年5月26号    by HSQ
+*******************************************************************************************************************/
+#include "main.h"
+#include "math.h"
 
-name: CI
+#define CAN_AIR_ID    0x30	//气缸控制ID
+#define OPEN_CYLINDER(channel)    ( g_uiAirValve |= (0x01 << (channel-1)) ) ; SendAirMsgByCan1(&g_uiAirValve)       //气缸开启
+#define CLOSE_CYLINDER(channel)   ( g_uiAirValve &= ( ~(0x01 << (channel-1)) ) ) ; SendAirMsgByCan1(&g_uiAirValve)  //气缸关闭
 
-# Controls when the action will run. Triggers the workflow on push or pull request
-# events but only for the master branch
-on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+/*************************************************************************************************************************/
+int keyamount=0;
+UINT32 g_uiAirValve = 0;	   //气缸有关全局变量
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
-jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+//电机码盘结构体 减速比i=19 码盘整周反馈范围0~8192
+ST_ENCODER g_stEncoder={0,0,0,0,19,8192,0,0,0};
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
-    steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
+//位置环PID结构体 kp=1
+ST_PID g_stPosPID={0,0,1,0,0,0,0,0,0,0,10000,10000,400,0,0,0};
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+//速度环PID结构体 kp=5.5
+ST_PID g_stSpdPID={0,0,5.5,0,0,0,0,0,0,0,10000,10000,400,0,0,0};
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+
+int a=0;//爪子开关
+int b=0;//弹射开关
+int i=0;//投掷次数
+
+int main(void)
+{
+	
+	BSP_Iinitialization();        //底层硬件初始化，一键开机 
+	
+    while(1)
+    {
+			delay_ms(1000);
+			CLOSE_CYLINDER(5);         //爪子开
+			delay_ms(5000);
+			
+			for(i=0;i<3;i++)
+			{
+				g_stPosPID.fpDes=300;    //回到原处
+				OPEN_CYLINDER(5);
+				delay_ms(1000);
+				
+				g_stPosPID.fpDes=5000;  //举起来，停一会
+				delay_ms(1000);
+				
+				g_stPosPID.fpDes=5500;  //举到目标位置
+				delay_ms(1000);
+				
+				CLOSE_CYLINDER(5);      //爪子开
+				delay_ms(500);
+				
+				g_stPosPID.fpDes=300;   //回到原处
+				delay_ms(2000);
+				
+				OPEN_CYLINDER(3);       //弹射
+				delay_ms(2000);
+				
+				CLOSE_CYLINDER(3);     //弹射归位
+				delay_ms(2000);
+			}
+			while(1);                //比赛结束，停机或按RESET重启
+    }
+}
+
+
+
+
+
+
+
+
+/*************************************************************************
+函 数 名：USB_LP_CAN1_RX0_IRQHandler
+函数功能：CAN1接收中断
+备    注：处理电调反馈数据
+*************************************************************************/
+ CanRxMsg rx_message;
+extern void Can1RxMsgDeal(CanRxMsg *pRxMessage);
+void USB_LP_CAN1_RX0_IRQHandler(void)
+{
+    if (CAN_GetITStatus(CAN1,CAN_IT_FMP0)!= RESET) 
+	{
+        CAN_ClearITPendingBit(CAN1, CAN_IT_FMP0);
+        CAN_Receive(CAN1, CAN_FIFO0, &rx_message);
+		
+		    //反馈数据的读取即处理
+		    Can1RxMsgDeal(&rx_message);
+    }
+}
+
+
+/*************************************************************************
+函 数 名：TIM2_IRQHandler
+函数功能：TIM2定时器中断服务函数
+备    注：工作频率200Hz  PID控制频率200Hz
+*************************************************************************/
+void TIM2_IRQHandler(void)
+{
+	if (TIM_GetITStatus(TIM2, TIM_IT_Update) != RESET)//检查指定的TIM中断发生与否 
+	{
+		TIM_ClearITPendingBit(TIM2, TIM_IT_Update  );//清除TIMx的中断待处理位 
+		LED_0_TOGGLE();
+		
+		/*****@@PID控制*******/
+		//<1>位置环PID控制
+		CalISeparatedPID(&g_stPosPID);
+		//<2>位置环PID控制 参考输入为位置环输出
+		g_stSpdPID.fpDes=g_stPosPID.fpU;
+		CalISeparatedPID(&g_stSpdPID);
+		//<3>向电调发送电流控制指令 
+		CAN1_Send_Data(0x200,0x00,0x00,(s16)(g_stSpdPID.fpU),0x00);
+	}
+}
+
+/*--------------------------------------------------------------------------------------------------------------------
+函数名:SendAirMsgByCan1()
+函数功能: 通过CAN1发送气缸的变量
+输入: pAir 要控制的气缸ID
+输出：无
+--------------------------------------------------------------------------------------------------------------------*/
+void SendAirMsgByCan1(UINT32* pAir)
+{
+	static CanTxMsg TxMessage = {CAN_AIR_ID, 0x00, CAN_ID_STD, CAN_RTR_DATA, 4, 0,0,0,0,0,0,0,0};
+	static UINT32 s_ucLastAir = 0;	
+	s_ucLastAir = *pAir;
+	*((UINT32*)TxMessage.Data) = s_ucLastAir;
+	CAN_Transmit(CAN1,&TxMessage);
+}
+
+
+/*************************************************************
+函 数 名：CalISeparatedPID
+函数功能：位置式PID控制算法，带积分抗饱和功能
+备    注：
+**************************************************************/
+void CalISeparatedPID(volatile ST_PID *pstPid)
+{   
+
+	pstPid->fpE=pstPid->fpDes-pstPid->fpFB;//计算当前偏差
+		
+	if((fabs(pstPid->fpE) <= pstPid->fpEMin))//偏差在累积范围之内
+	{
+		if(!(((pstPid->fpSumE>pstPid->fpEMax)&&(pstPid->fpE>=0))||((pstPid->fpSumE<=(-pstPid->fpEMax))&&(pstPid->fpE<=0))))/*若偏差过大，则积分项不累积偏差*/
+		{
+			pstPid->fpSumE+=pstPid->fpE;
+		}
+	}
+	else
+	{
+			pstPid->fpSumE=0;
+	}
+	
+	pstPid->fpUp=pstPid->fpKp * pstPid->fpE;
+	pstPid->fpUi=pstPid->fpKi * pstPid->fpSumE;
+  pstPid->fpUd=pstPid->fpKd * (pstPid->fpE - pstPid->fpPreE);
+	
+	/*位置式PID计算公式*/
+	pstPid->fpU = pstPid->fpKp * pstPid->fpE 
+	            + pstPid->fpKi * pstPid->fpSumE
+				      + pstPid->fpKd * (pstPid->fpE - pstPid->fpPreE);
+	
+	pstPid->fpPreE = pstPid->fpE;//保存本次偏差
+   
+	/*PID运算输出限幅,抑制积分饱和*/
+  if(pstPid->fpU > pstPid->fpUMax)
+	{
+	    pstPid->fpU = pstPid->fpUMax;
+	}
+	else if(pstPid->fpU < -pstPid->fpUMax)
+	{
+	    pstPid->fpU = -pstPid->fpUMax;
+	}
+}
+
+
+/*************************************************************
+函 数 名：Can1RxMsgDeal
+函数功能：电机反馈数据处理
+备    注：对应于电调ID为3
+**************************************************************/
+void Can1RxMsgDeal(CanRxMsg *pRxMessage)
+{
+	switch(pRxMessage->StdId)
+	{
+		case 0x203:
+		CAN1_Encoder_Process(&g_stEncoder,Get_Encoder_Number(pRxMessage),pRxMessage);
+		g_stSpdPID.fpFB=g_stEncoder.fpSpeed*19.0f;
+		g_stPosPID.fpFB=g_stEncoder.siSumValue/19.0f;
+		break;
+		
+		default:
+		break;
+	}
+
+}
+
+
+/*************************************************************
+函 数 名：CAN1_Encoder_Process
+函数功能：码盘处理函数
+备    注：
+**************************************************************/
+void CAN1_Encoder_Process(volatile ST_ENCODER* encoder, SINT32 value,CanRxMsg *pCanRxMsg)
+{
+	static UCHAR8 first_in_0x203=1;
+
+	encoder->siPreRawValue = encoder->siRawValue;
+	encoder->siRawValue = value;
+
+	if((pCanRxMsg->StdId==0x203)&&(!first_in_0x203))
+	{
+		//反转向下溢出
+		if(encoder->siRawValue-encoder->siPreRawValue>4000)
+		{
+			encoder->siPreRawValue+=8192;
+		}
+		//正转向上溢出
+		if(encoder->siRawValue-encoder->siPreRawValue<-4000)
+		{
+			encoder->siPreRawValue-=8192;
+		}
+		
+		if(pCanRxMsg->StdId==0x203)
+		{
+			encoder->siDiff = encoder->siRawValue - encoder->siPreRawValue;
+		}
+	}
+	
+	if((pCanRxMsg->StdId==0x203)&&first_in_0x203)
+	{
+		first_in_0x203=0;
+	}
+	
+	encoder->fpSpeed = Get_Speed(pCanRxMsg)/encoder->siGearRatio;//速度返回值，输出轴转速，单位：r/min
+	encoder->siSumValue += encoder->siDiff;//记录编码器的总数，位置闭环用	 
+}
+
+
+/*-------------------------------------------------------------------------------------------------
+函 数 名：GetEncoderNumber
+函数功能：接收6025、6623或RM3510电调板返回的机械角度值（绝对式编码器值）
+备    注：机械角度值范围：0~8191（0x1FFF）
+-------------------------------------------------------------------------------------------------*/
+SINT32 Get_Encoder_Number(CanRxMsg* rx_message)
+{
+  SINT32 encoder_temp;
+	encoder_temp = rx_message->Data[0]<<8 | rx_message->Data[1];
+	return encoder_temp;
+}
+
+
+/*-------------------------------------------------------------------------------------------------
+函 数 名：GetSpeed
+函数功能：接收RM3510电调板返回的转速，单位：r/min
+备    注：
+-------------------------------------------------------------------------------------------------*/
+SINT32 Get_Speed(CanRxMsg* rx_message)
+{
+    SINT32 speed_temp;
+	SINT32 base_value=0xFFFF;
+	if(rx_message->Data[2] & 0x01<<7)
+			{	
+				speed_temp = (base_value<<16 | rx_message->Data[2]<<8 | rx_message->Data[3]);
+			}
+			else
+			  speed_temp = (rx_message->Data[2]<<8 | rx_message->Data[3]);//rpm
+	return speed_temp;
+}
